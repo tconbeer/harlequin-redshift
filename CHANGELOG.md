@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-09-01
+
 - Initial release: a Harlequin adapter for Amazon Redshift, built on
   `redshift_connector`.
 - Lazy-loading data catalog (database → schema → relation → column) read
@@ -40,4 +42,5 @@ All notable changes to this project will be documented in this file.
   session rather than a statement, so one sent while the session is idle would
   land on whatever it ran next.
 
-[Unreleased]: https://github.com/tconbeer/harlequin-redshift/compare/main...HEAD
+[unreleased]: https://github.com/tconbeer/harlequin-redshift/compare/0.1.0...HEAD
+[0.1.0]: https://github.com/tconbeer/harlequin-redshift/compare/ee41915d03a844110a3d3ed923cd34ee6d375d30...0.1.0
