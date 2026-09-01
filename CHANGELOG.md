@@ -1,4 +1,4 @@
-# harlequin-redshift CHANGELOG
+# Harlequin-Redshift CHANGELOG
 
 All notable changes to this project will be documented in this file.
 
@@ -39,3 +39,5 @@ All notable changes to this project will be documented in this file.
 - `CANCEL` is only sent while a statement is actually running: it names a
   session rather than a statement, so one sent while the session is idle would
   land on whatever it ran next.
+
+[Unreleased]: https://github.com/tconbeer/harlequin-redshift/compare/main...HEAD
