@@ -10,7 +10,7 @@
   "platformAutomerge": true,
   "lockFileMaintenance": {
     "enabled": true,
-    "automerge": true,
+    "automerge": false,
     "schedule": ["before 6am on the first day of the month"]
   },
   "vulnerabilityAlerts": {
@@ -33,19 +33,19 @@
       "enabled": false
     },
     {
-      "description": "Group non-major updates into a single PR and merge on green CI.",
+      "description": "Group non-major updates into a single PR. Nothing here merges itself: the integration tests skip without a cluster to point at, so a green run has not exercised the driver. Turn automerge on once CI runs them.",
       "matchUpdateTypes": ["minor", "patch", "pin", "digest"],
       "groupName": "all non-major dependencies",
       "groupSlug": "all-nonmajor",
-      "automerge": true
+      "automerge": false
     },
     {
-      "description": "Majors get one PR each, but still merge themselves once CI is green.",
+      "description": "Majors get one PR each.",
       "matchUpdateTypes": ["major"],
-      "automerge": true
+      "automerge": false
     },
     {
-      "description": "textual and its satellites are pinned to exact, version-coupled releases; upgrade them together by hand. This adapter gets them through harlequin, so the rule bites only if one is ever added directly. Listed last so it overrides the automerge rules above.",
+      "description": "textual and its satellites are pinned to exact, version-coupled releases; upgrade them together by hand. This adapter gets them through harlequin, so the rule bites only if one is ever added directly.",
       "matchPackageNames": ["/textual/"],
       "groupName": "textual",
       "groupSlug": "textual",
