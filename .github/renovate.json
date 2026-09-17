@@ -1,0 +1,55 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":dependencyDashboard"
+  ],
+  "timezone": "America/New_York",
+  "schedule": ["before 6am on monday"],
+  "prConcurrentLimit": 5,
+  "platformAutomerge": true,
+  "lockFileMaintenance": {
+    "enabled": true,
+    "automerge": false,
+    "schedule": ["before 6am on the first day of the month"]
+  },
+  "vulnerabilityAlerts": {
+    "enabled": true,
+    "labels": ["security"],
+    "schedule": ["at any time"],
+    "prCreation": "immediate",
+    "minimumReleaseAge": null
+  },
+  "osvVulnerabilityAlerts": true,
+  "packageRules": [
+    {
+      "description": "The supported Python floor is a project decision, not a dependency. Renovate reads it from .python-version and the setup-python pins in the workflows; both must be disabled or it will keep trying to drag the project to the newest interpreter.",
+      "matchDepNames": ["python"],
+      "matchDatasources": ["python-version", "github-releases", "docker"],
+      "enabled": false
+    },
+    {
+      "matchFileNames": [".python-version"],
+      "enabled": false
+    },
+    {
+      "description": "Group non-major updates into a single PR. Nothing here merges itself: the integration tests skip without a cluster to point at, so a green run has not exercised the driver. Turn automerge on once CI runs them.",
+      "matchUpdateTypes": ["minor", "patch", "pin", "digest"],
+      "groupName": "all non-major dependencies",
+      "groupSlug": "all-nonmajor",
+      "automerge": false
+    },
+    {
+      "description": "Majors get one PR each.",
+      "matchUpdateTypes": ["major"],
+      "automerge": false
+    },
+    {
+      "description": "textual and its satellites are pinned to exact, version-coupled releases; upgrade them together by hand. This adapter gets them through harlequin, so the rule bites only if one is ever added directly.",
+      "matchPackageNames": ["/textual/"],
+      "groupName": "textual",
+      "groupSlug": "textual",
+      "automerge": false
+    }
+  ]
+}
