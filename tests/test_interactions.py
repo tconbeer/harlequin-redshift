@@ -324,7 +324,7 @@ def test_show_definition_names_the_relation(
 
     [sql] = connection.executed
     assert sql.startswith(command)
-    assert dotted_name(sql[len(command) :]) == [DATABASE, name, name]
+    assert dotted_name(sql[len(command) :]) == [name, name]
     # the header that quotes the query back stays a comment, whatever the name
     [text] = driver.inserted
     assert unquoted_text(text).strip() == "create table t (a int)"
@@ -359,7 +359,7 @@ def test_drop_relation_names_the_relation(
 
     [sql] = connection.executed
     assert sql.startswith(command)
-    assert dotted_name(sql[len(command) :]) == [DATABASE, name, name]
+    assert dotted_name(sql[len(command) :]) == [name, name]
 
 
 @pytest.mark.parametrize("name", AWKWARD_NAMES)
@@ -370,7 +370,7 @@ def test_drop_schema_names_the_schema(name: str) -> None:
     [sql] = connection.executed
     command, suffix = "drop schema ", " cascade"
     assert sql.startswith(command) and sql.endswith(suffix)
-    assert dotted_name(sql[len(command) : -len(suffix)]) == [DATABASE, name]
+    assert dotted_name(sql[len(command) : -len(suffix)]) == [name]
 
 
 @pytest.mark.parametrize("name", AWKWARD_NAMES)

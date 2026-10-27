@@ -478,7 +478,7 @@ def _show_definition(
     """
     if item.connection is None or item.parent is None:
         return
-    query = f"{show_command} {item.qualified_identifier}"
+    query = f"{show_command} {item.query_name}"
     try:
         cur = item.connection.execute(query)
     except HarlequinQueryError:
@@ -529,7 +529,7 @@ def execute_drop_relation_statement(
         if item.connection is None:
             return
         try:
-            item.connection.execute(f"drop {relation_type} {item.qualified_identifier}")
+            item.connection.execute(f"drop {relation_type} {item.query_name}")
         except HarlequinQueryError:
             driver.notify(
                 f"Could not drop {relation_type} {item.label}", severity="error"
@@ -578,7 +578,7 @@ def execute_drop_schema_statement(
         if item.connection is None:
             return
         try:
-            item.connection.execute(f"drop schema {item.qualified_identifier} cascade")
+            item.connection.execute(f"drop schema {item.query_name} cascade")
         except HarlequinQueryError:
             driver.notify(f"Could not drop schema {item.label}", severity="error")
             raise
