@@ -502,13 +502,15 @@ class _BrokenCursor:
 
     def __init__(self, error: Exception | None = None) -> None:
         self.error = error or KeyError("database_name")
-        self.legacy_calls = 0
+        self.fallback_calls = 0
 
     def get_schemas(self, **kwargs: object) -> list:
         raise self.error
 
-    def get_schemas_legacy_hardcoded_query(self, **kwargs: object) -> list:
-        self.legacy_calls += 1
+    def execute(self, sql: str, params: object = None) -> None:
+        self.fallback_calls += 1
+
+    def fetchall(self) -> list:
         return [("public", "dev")]
 
 
@@ -516,6 +518,7 @@ def _connection_with_cursor(cursor: object) -> HarlequinRedshiftConnection:
     """A connection stub whose metadata calls run against `cursor`."""
     conn = HarlequinRedshiftConnection.__new__(HarlequinRedshiftConnection)
     conn.database = "dev"
+    conn.all_databases = False
     conn.read_only = False
     conn._session_read_only = True
     conn._use_show_metadata = True
@@ -531,12 +534,12 @@ def _connection_with_cursor(cursor: object) -> HarlequinRedshiftConnection:
     return conn
 
 
-def test_metadata_falls_back_to_the_legacy_query() -> None:
+def test_metadata_falls_back_to_the_catalog_query() -> None:
     cursor = _BrokenCursor()
     conn = _connection_with_cursor(cursor)
 
     assert conn._get_schemas("dev") == ["public"]
-    assert cursor.legacy_calls == 1
+    assert cursor.fallback_calls == 1
 
 
 def test_a_broken_show_path_is_only_tried_once() -> None:
@@ -550,7 +553,7 @@ def test_a_broken_show_path_is_only_tried_once() -> None:
 
     for _ in range(5):
         assert conn._get_schemas("dev") == ["public"]
-    assert cursor.legacy_calls == 6
+    assert cursor.fallback_calls == 6
 
 
 @pytest.mark.parametrize(
@@ -561,10 +564,10 @@ def test_every_index_error_falls_back(error: Exception) -> None:
     conn = _connection_with_cursor(cursor)
 
     assert conn._get_schemas("dev") == ["public"]
-    assert cursor.legacy_calls == 1
+    assert cursor.fallback_calls == 1
 
 
-def test_a_server_error_is_not_retried_on_the_legacy_query() -> None:
+def test_a_server_error_is_not_retried_on_the_catalog_query() -> None:
     """A permission or connection failure must surface, not be worked around."""
     cursor = _BrokenCursor(
         error=Exception({"C": "42501", "M": "permission denied for database dev"})
@@ -574,10 +577,10 @@ def test_a_server_error_is_not_retried_on_the_legacy_query() -> None:
     with pytest.raises(HarlequinQueryError) as excinfo:
         conn._get_schemas("dev")
     assert "permission denied" in str(excinfo.value)
-    assert cursor.legacy_calls == 0
+    assert cursor.fallback_calls == 0
 
 
-def test_without_a_legacy_query_the_error_explains_itself() -> None:
+def test_without_a_fallback_the_error_explains_itself() -> None:
     cursor = _BrokenCursor()
     conn = _connection_with_cursor(cursor)
 

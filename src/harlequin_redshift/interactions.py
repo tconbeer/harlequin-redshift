@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING, Literal, Sequence
 from harlequin.catalog import CatalogItem
 from harlequin.exception import HarlequinQueryError
 
+from harlequin_redshift.quoting import quote_identifier, quote_literal
+
 if TYPE_CHECKING:
     from harlequin.driver import HarlequinDriver
 
@@ -29,17 +31,6 @@ if TYPE_CHECKING:
     )
 
 
-def _literal(value: str) -> str:
-    """A string as a SQL literal, with its quotes escaped.
-
-    These queries are built by interpolation rather than by binding, because
-    they are handed to the user as text to read and run, not executed with
-    parameters.
-    """
-    escaped = value.replace("'", "''")
-    return f"'{escaped}'"
-
-
 def _database_predicate(item: "RelationCatalogItem | SchemaCatalogItem") -> str:
     """The SVV_ALL_* filter that scopes a query to one item's database.
 
@@ -48,7 +39,16 @@ def _database_predicate(item: "RelationCatalogItem | SchemaCatalogItem") -> str:
     the catalog item actually came from.
     """
     database = _root_label(item)
-    return f"database_name = {_literal(database)}" if database else "true"
+    return f"database_name = {quote_literal(database)}" if database else "true"
+
+
+def _one_line(text: str) -> str:
+    """`text` with its line breaks flattened, to sit inside a ``--`` comment.
+
+    A quoted name may hold a newline, which would end the comment and leave
+    the rest of the name in the buffer as SQL.
+    """
+    return " ".join(text.splitlines())
 
 
 def _root_label(item: CatalogItem) -> str | None:
@@ -70,8 +70,15 @@ def execute_use_statement(
 ) -> None:
     if item.connection is None:
         return
+    if item.parent is not None and not item.parent.is_connected_database:
+        # search_path names schemas of the connected database only
+        driver.notify(
+            f"Cannot switch context to {item.label}: it is in another database.",
+            severity="error",
+        )
+        return
     try:
-        item.connection.execute(f"set search_path to {item.qualified_identifier}")
+        item.connection.execute(f"set search_path to {quote_identifier(item.label)}")
     except HarlequinQueryError:
         driver.notify("Could not switch context", severity="error")
         raise
@@ -132,8 +139,8 @@ def show_describe_relation(
             from svv_all_columns
             where
                 {_database_predicate(item)}
-                and schema_name = {_literal(item.parent.label)}
-                and table_name = {_literal(item.label)}
+                and schema_name = {quote_literal(item.parent.label)}
+                and table_name = {quote_literal(item.label)}
             order by ordinal_position
             """.strip("\n")
         )
@@ -171,8 +178,8 @@ def show_describe_table_design(
             from svv_redshift_columns
             where
                 {_database_predicate(item)}
-                and schema_name = {_literal(item.parent.label)}
-                and table_name = {_literal(item.label)}
+                and schema_name = {quote_literal(item.parent.label)}
+                and table_name = {quote_literal(item.label)}
             order by ordinal_position
             """.strip("\n")
         )
@@ -213,8 +220,8 @@ def show_table_info(
                 encoded as "Encoded"
             from svv_table_info
             where
-                "schema" = {_literal(item.parent.label)}
-                and "table" = {_literal(item.label)}
+                "schema" = {quote_literal(item.parent.label)}
+                and "table" = {quote_literal(item.label)}
             """.strip("\n")
         )
     )
@@ -258,8 +265,8 @@ def show_describe_table_constraints(
             join pg_catalog.pg_namespace n on n.oid = c.relnamespace
             left join pg_catalog.pg_class fc on con.confrelid = fc.oid
             where
-                c.relname = {_literal(item.label)}
-                and n.nspname = {_literal(item.parent.label)}
+                c.relname = {quote_literal(item.label)}
+                and n.nspname = {quote_literal(item.parent.label)}
             order by con.conname
             """.strip("\n")
         )
@@ -291,8 +298,8 @@ def show_external_table_definition(
                 parameters as "Parameters"
             from svv_external_tables
             where
-                schemaname = {_literal(item.parent.label)}
-                and tablename = {_literal(item.label)}
+                schemaname = {quote_literal(item.parent.label)}
+                and tablename = {quote_literal(item.label)}
             """.strip("\n")
         )
     )
@@ -323,8 +330,8 @@ def show_materialized_view_info(
                 updated_upto_xid as "Updated Up To XID"
             from svv_mv_info
             where
-                schema_name = {_literal(item.parent.label)}
-                and name = {_literal(item.label)}
+                schema_name = {quote_literal(item.parent.label)}
+                and name = {quote_literal(item.label)}
             """.strip("\n")
         )
     )
@@ -342,11 +349,13 @@ def show_list_objects(
     if type(item).__name__ == "SchemaCatalogItem":
         parent = getattr(item, "parent", None)
         database = parent.label if parent is not None else None
-        scope = f"and schema_name = {_literal(item.label)}"
+        scope = f"and schema_name = {quote_literal(item.label)}"
     else:
         database = item.label
         scope = ""
-    database_filter = f"database_name = {_literal(database)}" if database else "true"
+    database_filter = (
+        f"database_name = {quote_literal(database)}" if database else "true"
+    )
     driver.insert_text_in_new_buffer(
         dedent(
             f"""
@@ -381,7 +390,7 @@ def show_list_schemas(
                 source_database as "Source Database",
                 schema_acl as "Privileges"
             from svv_all_schemas
-            where database_name = {_literal(item.label)}
+            where database_name = {quote_literal(item.label)}
             order by 1, 2
             """.strip("\n")
         )
@@ -399,7 +408,7 @@ def show_storage_summary(
     """
     # can't use isinstance due to circular reference
     if type(item).__name__ == "SchemaCatalogItem":
-        scope = f'where "schema" = {_literal(item.label)}'
+        scope = f'where "schema" = {quote_literal(item.label)}'
     else:
         scope = ""
     driver.insert_text_in_new_buffer(
@@ -458,8 +467,8 @@ def _show_definition(
         return
     definition = str(result[0][0])
     driver.insert_text_in_new_buffer(
-        f"-- {what.capitalize()} definition for {item.query_name}\n"
-        f"-- from: {query}\n\n"
+        f"-- {what.capitalize()} definition for {_one_line(item.query_name)}\n"
+        f"-- from: {_one_line(query)}\n\n"
         f"{definition}"
     )
 

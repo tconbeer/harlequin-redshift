@@ -14,6 +14,8 @@ from pathlib import Path
 from harlequin import HarlequinCompletion
 from redshift_connector import Connection
 
+from harlequin_redshift.quoting import quote_identifier_if_needed
+
 logger = logging.getLogger(__name__)
 
 _SYSTEM_SCHEMAS = frozenset({"pg_catalog", "information_schema"})
@@ -94,7 +96,7 @@ def _routine_completions(conn: Connection) -> list[HarlequinCompletion]:
             HarlequinCompletion(
                 label=name,
                 type_label="agg" if is_aggregate else "fn",
-                value=name,
+                value=quote_identifier_if_needed(name),
                 priority=1000,
                 context=context,
             )
