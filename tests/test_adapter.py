@@ -21,6 +21,7 @@ from harlequin_redshift.adapter import (
     _is_canceled,
     _is_user_schema,
 )
+from harlequin_redshift.catalog import DatabaseCatalogItem
 from harlequin_redshift.cli_options import REDSHIFT_OPTIONS
 
 
@@ -650,3 +651,53 @@ def test_with_the_show_path_the_tree_asks_the_driver() -> None:
 
     assert conn._get_schemas("dev") == ["analytics"]
     assert cursor.fallback_calls == 0
+
+
+class _SessionCursor:
+    def __init__(self, row: tuple | Exception) -> None:
+        self.row = row
+
+    def execute(self, sql: str) -> None:
+        if isinstance(self.row, Exception):
+            raise self.row
+
+    def fetchone(self) -> tuple:
+        assert not isinstance(self.row, Exception)
+        return self.row
+
+    def close(self) -> None:
+        pass
+
+
+class _SessionConnection:
+    def __init__(self, row: tuple | Exception) -> None:
+        self.row = row
+
+    def cursor(self) -> _SessionCursor:
+        return _SessionCursor(self.row)
+
+
+def test_the_connected_database_is_named_the_way_the_server_names_it() -> None:
+    """`-d DEV` connects to `dev`, which is the name the catalog reports."""
+    conn = _connection_with_cursor(_BrokenCursor())
+    conn.database = "DEV"
+    conn._main_conn = _SessionConnection((4321, "dev"))  # type: ignore[assignment]
+
+    conn._read_session()
+
+    assert conn.database == "dev"
+    assert conn._backend_pid == 4321
+    database = DatabaseCatalogItem.from_label(label="dev", connection=conn)
+    assert database.is_connected_database is True
+
+
+def test_an_unreadable_session_keeps_the_typed_database() -> None:
+    conn = _connection_with_cursor(_BrokenCursor())
+    conn.database = "DEV"
+    conn._backend_pid = None
+    conn._main_conn = _SessionConnection(InterfaceError("closed"))  # type: ignore[assignment]
+
+    conn._read_session()
+
+    assert conn.database == "DEV"
+    assert conn._backend_pid is None

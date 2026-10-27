@@ -291,6 +291,7 @@ class HarlequinRedshiftConnection(HarlequinConnection):
         ] = not self.all_databases
 
         self.database: str = str(self.connect_kwargs["database"])
+        """The connected database's name, as the server spells it once connected."""
         self._use_show_metadata = True
         """False when the driver's server-side metadata path is not used.
 
@@ -325,7 +326,8 @@ class HarlequinRedshiftConnection(HarlequinConnection):
                 title="Harlequin could not connect to Redshift.",
             ) from e
 
-        self._backend_pid: int | None = self._get_backend_pid()
+        self._backend_pid: int | None = None
+        self._read_session()
         self._use_show_metadata = self._supports_show_metadata()
 
         self._transaction_modes = cycle(
@@ -436,22 +438,28 @@ class HarlequinRedshiftConnection(HarlequinConnection):
             except Exception:
                 logger.debug("Could not end the read-only probe", exc_info=True)
 
-    def _get_backend_pid(self) -> int | None:
-        """The server-side process id of the main connection.
+    def _read_session(self) -> None:
+        """Reads the main connection's process id and database name.
 
-        Redshift cancels a running statement by process id, so this is looked up
-        once, while the connection is idle, and kept for ``cancel()``.
+        Redshift cancels a running statement by process id, so it is looked up
+        once, while the connection is idle, and kept for ``cancel()``. The
+        database name the user typed may differ in case from the one the
+        server reports, and the catalog names databases the server's way.
         """
         cur = self._main_conn.cursor()
         try:
-            cur.execute("select pg_backend_pid()")
+            cur.execute("select pg_backend_pid(), current_database()")
             result = cur.fetchone()
         except Exception:
-            logger.debug("Could not read the backend pid", exc_info=True)
-            return None
+            logger.debug("Could not read the session's pid and database", exc_info=True)
+            return
         finally:
             _close_quietly(cur)
-        return int(result[0]) if result else None
+        if not result:
+            return
+        self._backend_pid = int(result[0])
+        if result[1]:
+            self.database = str(result[1])
 
     def _supports_show_metadata(self) -> bool:
         """True if the driver's metadata calls take the server-side SHOW path."""
