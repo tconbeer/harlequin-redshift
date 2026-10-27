@@ -130,7 +130,7 @@ class _ShowCursor(_RecordingCursor):
 
     def get_columns(self, **kwargs: object) -> list:
         self.show_calls += 1
-        jdbc_row = [None] * 17
+        jdbc_row: list[object] = [None] * 17
         jdbc_row[:4] = ["dev", self.name, self.name, self.name]
         jdbc_row[5], jdbc_row[6], jdbc_row[16] = "int4", 10, 1
         return [tuple(jdbc_row)]
