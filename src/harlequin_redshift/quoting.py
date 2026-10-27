@@ -14,9 +14,8 @@ _PLAIN_IDENTIFIER = re.compile(r"[a-z_][a-z0-9_$]*")
 LIKE_ESCAPE = "!"
 """The escape character for patterns built by `like_contains()`.
 
-Not a backslash, because Redshift also reads a backslash as an escape inside a
-string literal, so a backslash escape would mean different things in bound and
-inlined patterns.
+Redshift gives ``!`` no meaning inside a string literal, so a pattern escaped
+with it means the same thing whether it is bound or written into SQL text.
 """
 
 

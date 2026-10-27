@@ -203,9 +203,8 @@ _RELATION_CLASSES: dict[str, type[RelationCatalogItem]] = {
 }
 """The item class for each relation type the server reports.
 
-``get_tables()`` spells the type differently depending on whether the cluster
-answers metadata from SHOW discovery, from SVV_ALL_TABLES, or from the driver's
-legacy pg_catalog query, so every spelling that reaches us is mapped here.
+The driver's SHOW discovery, SVV_TABLES, and SVV_ALL_TABLES each spell relation
+types their own way, so every spelling that reaches us is mapped here.
 """
 
 
