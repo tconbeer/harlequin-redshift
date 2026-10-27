@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import Any, Callable
 
 import pytest
+from recording_driver import RecordingDriver, run_interaction
 from sql_text import AWKWARD_NAMES, dotted_name, identifiers, literals, unquoted_text
 
 from harlequin_redshift.catalog import (
@@ -76,36 +77,6 @@ class _Connection:
 
     def _get_schemas(self, database: str) -> list:
         return ["public"]
-
-
-class _Driver:
-    """Records what an interaction hands back to Harlequin."""
-
-    def __init__(self) -> None:
-        self.inserted: list[str] = []
-        self.notifications: list[tuple[str, str]] = []
-
-    def insert_text_in_new_buffer(self, text: str) -> None:
-        self.inserted.append(text)
-
-    def insert_text_at_selection(self, text: str) -> None:
-        self.inserted.append(text)
-
-    def notify(self, message: str, severity: str = "information") -> None:
-        self.notifications.append((message, severity))
-
-    def confirm_and_execute(self, callback: Callable[[], None]) -> None:
-        callback()
-
-    def refresh_catalog(self) -> None:
-        pass
-
-
-def _run(
-    interaction: Callable[[Any, Any], None], item: object, driver: _Driver
-) -> None:
-    """Runs `interaction` the way Harlequin would, with the recording driver."""
-    interaction(item, driver)
 
 
 def _database(connection: _Connection, label: str = DATABASE) -> DatabaseCatalogItem:
@@ -209,7 +180,7 @@ def test_relation_descriptions_filter_on_the_exact_names(
     expected: Callable[[str, str], list[str]],
 ) -> None:
     schema = f"s {name}"
-    driver = _Driver()
+    driver = RecordingDriver()
     interaction(_relation(_Connection(), item_class, schema, name), driver)
 
     [sql] = driver.inserted
@@ -221,8 +192,8 @@ def test_relation_descriptions_filter_on_the_exact_names(
 
 @pytest.mark.parametrize("name", AWKWARD_NAMES)
 def test_preview_selects_from_the_relation(name: str) -> None:
-    driver = _Driver()
-    _run(
+    driver = RecordingDriver()
+    run_interaction(
         show_select_star, _relation(_Connection(), TableCatalogItem, name, name), driver
     )
     [sql] = driver.inserted
@@ -232,9 +203,9 @@ def test_preview_selects_from_the_relation(name: str) -> None:
 
 @pytest.mark.parametrize("name", AWKWARD_NAMES)
 def test_insert_columns_quotes_each_column(name: str) -> None:
-    driver = _Driver()
+    driver = RecordingDriver()
     connection = _Connection(column_name=name)
-    _run(
+    run_interaction(
         insert_columns_at_cursor,
         _relation(connection, TableCatalogItem, "public", "t"),
         driver,
@@ -249,9 +220,9 @@ def test_schema_listings_filter_on_the_exact_names(name: str) -> None:
     connection = _Connection()
     schema = _schema(connection, name)
 
-    driver = _Driver()
-    _run(show_list_objects, schema, driver)
-    _run(show_storage_summary, schema, driver)
+    driver = RecordingDriver()
+    run_interaction(show_list_objects, schema, driver)
+    run_interaction(show_storage_summary, schema, driver)
     list_objects, storage_summary = driver.inserted
     assert literals(list_objects) == [DATABASE, name]
     assert literals(storage_summary) == [name]
@@ -263,10 +234,10 @@ def test_schema_listings_filter_on_the_exact_names(name: str) -> None:
 def test_database_listings_filter_on_the_exact_name(name: str) -> None:
     database = _database(_Connection(), label=name)
 
-    driver = _Driver()
-    _run(show_list_objects, database, driver)
-    _run(show_list_schemas, database, driver)
-    _run(show_storage_summary, database, driver)
+    driver = RecordingDriver()
+    run_interaction(show_list_objects, database, driver)
+    run_interaction(show_list_schemas, database, driver)
+    run_interaction(show_storage_summary, database, driver)
     list_objects, list_schemas, storage_summary = driver.inserted
     assert literals(list_objects) == [name]
     assert literals(list_schemas) == [name]
@@ -281,8 +252,8 @@ def test_database_listings_filter_on_the_exact_name(name: str) -> None:
 @pytest.mark.parametrize("name", AWKWARD_NAMES)
 def test_set_search_path_names_only_the_schema(name: str) -> None:
     connection = _Connection()
-    driver = _Driver()
-    _run(execute_use_statement, _schema(connection, name), driver)
+    driver = RecordingDriver()
+    run_interaction(execute_use_statement, _schema(connection, name), driver)
 
     [sql] = connection.executed
     prefix = "set search_path to "
@@ -294,9 +265,9 @@ def test_set_search_path_refuses_another_database() -> None:
     connection = _Connection()
     other = _database(connection, label="other")
     schema = SchemaCatalogItem.from_parent(parent=other, label="public")
-    driver = _Driver()
+    driver = RecordingDriver()
 
-    _run(execute_use_statement, schema, driver)
+    run_interaction(execute_use_statement, schema, driver)
 
     assert connection.executed == []
     [(_message, severity)] = driver.notifications
@@ -319,7 +290,7 @@ def test_show_definition_names_the_relation(
     command: str,
 ) -> None:
     connection = _Connection()
-    driver = _Driver()
+    driver = RecordingDriver()
     interaction(_relation(connection, item_class, name, name), driver)
 
     [sql] = connection.executed
@@ -355,7 +326,7 @@ def test_drop_relation_names_the_relation(
     command: str,
 ) -> None:
     connection = _Connection()
-    interaction(_relation(connection, item_class, name, name), _Driver())
+    interaction(_relation(connection, item_class, name, name), RecordingDriver())
 
     [sql] = connection.executed
     assert sql.startswith(command)
@@ -365,7 +336,9 @@ def test_drop_relation_names_the_relation(
 @pytest.mark.parametrize("name", AWKWARD_NAMES)
 def test_drop_schema_names_the_schema(name: str) -> None:
     connection = _Connection()
-    _run(execute_drop_schema_statement, _schema(connection, name), _Driver())
+    run_interaction(
+        execute_drop_schema_statement, _schema(connection, name), RecordingDriver()
+    )
 
     [sql] = connection.executed
     command, suffix = "drop schema ", " cascade"
@@ -376,7 +349,11 @@ def test_drop_schema_names_the_schema(name: str) -> None:
 @pytest.mark.parametrize("name", AWKWARD_NAMES)
 def test_drop_database_names_the_database(name: str) -> None:
     connection = _Connection()
-    _run(execute_drop_database_statement, _database(connection, label=name), _Driver())
+    run_interaction(
+        execute_drop_database_statement,
+        _database(connection, label=name),
+        RecordingDriver(),
+    )
 
     [sql] = connection.executed
     command = "drop database "

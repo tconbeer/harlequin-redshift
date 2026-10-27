@@ -1,14 +1,19 @@
 """Catalog tests: the tree, its interactions, and search.
 
-Everything here reads. The relations these tests walk are found on the cluster
-at run time by the `a_relation` fixture, so the suite does not assume any
-particular object exists.
+Everything here reads, except `test_awkward_names_load_search_and_interact`,
+which creates a uniquely named schema and drops it. The relations the other
+tests walk are found on the cluster at run time by the `a_relation` fixture,
+so the suite does not assume any particular object exists.
 """
 
 from __future__ import annotations
 
+import uuid
+from typing import Any, Generator
+
 import pytest
 from harlequin.catalog import CatalogSearchResult, InteractiveCatalogItem
+from recording_driver import RecordingDriver, run_interaction
 
 from harlequin_redshift.adapter import HarlequinRedshiftConnection
 from harlequin_redshift.catalog import (
@@ -24,7 +29,24 @@ from harlequin_redshift.catalog import (
     relation_class,
     relation_item,
 )
-from harlequin_redshift.quoting import qualified_name, quote_identifier
+from harlequin_redshift.interactions import (
+    execute_drop_schema_statement,
+    execute_drop_table_statement,
+    execute_drop_view_statement,
+    execute_use_statement,
+    insert_columns_at_cursor,
+    show_describe_relation,
+    show_describe_table_constraints,
+    show_describe_table_design,
+    show_list_objects,
+    show_list_schemas,
+    show_select_star,
+    show_storage_summary,
+    show_table_definition,
+    show_table_info,
+    show_view_definition,
+)
+from harlequin_redshift.quoting import qualified_name, quote_identifier, quote_literal
 
 # -- item construction (no cluster needed) ------------------------------------
 
@@ -400,3 +422,147 @@ def test_search_returns_search_results(
     results = connection.search_catalog(relation)
     assert results
     assert all(isinstance(r, CatalogSearchResult) for r in results)
+
+
+# -- against a real cluster: awkward names (creates and drops its own schema) --
+
+_AWKWARD_TABLES = ("a\\b", 'we"ird', "x'y")
+_AWKWARD_VIEW = "v;w"
+
+
+def _rows(connection: HarlequinRedshiftConnection, sql: str) -> list[list[Any]]:
+    cur = connection.execute(sql)
+    assert cur is not None, sql
+    data = cur.fetchall()
+    assert data is not None
+    return [list(row) for row in data]
+
+
+@pytest.fixture
+def awkward_schema(
+    connection: HarlequinRedshiftConnection,
+) -> Generator[SchemaCatalogItem, None, None]:
+    """A schema of its own, with tables and a view whose names need quoting.
+
+    Every name is lower case, so the test holds whether or not the cluster
+    turns on case-sensitive identifiers. The schema is dropped afterwards.
+    """
+    schema = f"hq_{uuid.uuid4().hex[:8]} a\\b\"'"
+    connection.execute(f"create schema {quote_identifier(schema)}")
+    try:
+        for name in _AWKWARD_TABLES:
+            table = qualified_name(schema, name)
+            connection.execute(
+                f"create table {table} ({quote_identifier(name)} varchar(16))"
+            )
+            connection.execute(f"insert into {table} values ({quote_literal(name)})")
+        connection.execute(
+            f"create view {qualified_name(schema, _AWKWARD_VIEW)} as "
+            f"select * from {qualified_name(schema, _AWKWARD_TABLES[0])}"
+        )
+        [database] = [
+            item
+            for item in connection.get_catalog().items
+            if isinstance(item, DatabaseCatalogItem)
+            and item.label == connection.database
+        ]
+        [schema_item] = [i for i in database.fetch_children() if i.label == schema]
+        yield schema_item
+    finally:
+        connection.execute(f"drop schema if exists {quote_identifier(schema)} cascade")
+
+
+def test_awkward_names_load_search_and_interact(
+    connection: HarlequinRedshiftConnection, awkward_schema: SchemaCatalogItem
+) -> None:
+    """Redshift's own answer to every quoting rule this adapter relies on."""
+    schema = awkward_schema.label
+    database = connection.database
+
+    # a literal holding a backslash reads back as written
+    for name in _AWKWARD_TABLES:
+        assert _rows(connection, f"select * from {qualified_name(schema, name)}") == [
+            [name]
+        ]
+
+    # the tree
+    relations = {item.label: item for item in awkward_schema.fetch_children()}
+    assert set(relations) == {*_AWKWARD_TABLES, _AWKWARD_VIEW}
+    for name in _AWKWARD_TABLES:
+        assert [c.label for c in relations[name].fetch_children()] == [name]
+        assert isinstance(relations[name], TableCatalogItem)
+    assert isinstance(relations[_AWKWARD_VIEW], ViewCatalogItem)
+
+    # search
+    for name in (*_AWKWARD_TABLES, _AWKWARD_VIEW):
+        found = connection.search_catalog(name, kind="relations")
+        assert any(
+            r.item.label == name and r.parents == (database, schema) for r in found
+        ), name
+    found_schemas = connection.search_catalog(schema, kind="all")
+    assert any(r.item.label == schema for r in found_schemas)
+
+    # editor-inserted SQL runs and targets each table
+    for name in _AWKWARD_TABLES:
+        table = relations[name]
+        driver = RecordingDriver()
+        for interaction in (
+            show_select_star,
+            insert_columns_at_cursor,
+            show_describe_relation,
+            show_describe_table_design,
+            show_table_info,
+            show_describe_table_constraints,
+        ):
+            run_interaction(interaction, table, driver)
+        (
+            select_star,
+            column_list,
+            describe,
+            design,
+            table_info,
+            constraints,
+        ) = driver.inserted
+        assert _rows(connection, select_star) == [[name]]
+        assert _rows(connection, f"select {column_list} from {table.query_name}") == [
+            [name]
+        ]
+        assert [row[0] for row in _rows(connection, describe)] == [name]
+        assert [row[0] for row in _rows(connection, design)] == [name]
+        assert all(row[1] == name for row in _rows(connection, table_info))
+        assert _rows(connection, constraints) == []
+
+        run_interaction(show_table_definition, table, driver)
+        assert driver.notifications == []
+        _header, _blank, definition = driver.inserted[-1].partition("\n\n")
+        assert definition.strip()
+
+    driver = RecordingDriver()
+    run_interaction(show_view_definition, relations[_AWKWARD_VIEW], driver)
+    assert driver.notifications == []
+
+    run_interaction(show_list_objects, awkward_schema, driver)
+    listed = _rows(connection, driver.inserted[-1])
+    assert {row[2] for row in listed} == {*_AWKWARD_TABLES, _AWKWARD_VIEW}
+    assert awkward_schema.parent is not None
+    run_interaction(show_list_schemas, awkward_schema.parent, driver)
+    assert schema in {row[1] for row in _rows(connection, driver.inserted[-1])}
+    run_interaction(show_storage_summary, awkward_schema, driver)
+    assert all(row[0] == schema for row in _rows(connection, driver.inserted[-1]))
+
+    # the actions that execute
+    try:
+        run_interaction(execute_use_statement, awkward_schema, driver)
+        assert _rows(connection, "select current_schema()") == [[schema]]
+    finally:
+        connection.execute("reset search_path")
+
+    run_interaction(execute_drop_view_statement, relations[_AWKWARD_VIEW], driver)
+    run_interaction(execute_drop_table_statement, relations["a\\b"], driver)
+    assert {item.label for item in awkward_schema.fetch_children()} == {
+        'we"ird',
+        "x'y",
+    }
+    run_interaction(execute_drop_schema_statement, awkward_schema, driver)
+    assert awkward_schema.parent is not None
+    assert schema not in {i.label for i in awkward_schema.parent.fetch_children()}
