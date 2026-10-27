@@ -22,6 +22,23 @@ Rows = Sequence[Sequence[Any]]
 
 _LIKE = f"like %s escape '{LIKE_ESCAPE}'"
 
+_DRIVER_TYPE_NAMES = {
+    "boolean": "bool",
+    "character varying": "varchar",
+    '"char"': "char",
+    "smallint": "int2",
+    "integer": "int4",
+    "bigint": "int8",
+    "real": "float4",
+    "double precision": "float8",
+    "timestamp without time zone": "timestamp",
+    "timestamp with time zone": "timestamptz",
+}
+"""SQL-standard type names, spelled the way the driver's metadata calls spell them.
+
+The catalog shows the same type name whichever path loaded a column.
+"""
+
 _SCHEMAS_IN_CONNECTED_DATABASE = """
 select nspname, current_database()
 from pg_catalog.pg_namespace
@@ -148,4 +165,7 @@ def columns(
         filters.append(("table_name = %s", relation))
     if name_like is not None:
         filters.append((f"column_name {_LIKE}", name_like))
-    return _run(cur, query, database, filters)
+    return [
+        (*row[:4], _DRIVER_TYPE_NAMES.get(row[4], row[4]), *row[5:])
+        for row in _run(cur, query, database, filters)
+    ]

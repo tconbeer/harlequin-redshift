@@ -224,3 +224,23 @@ def test_routine_completions_quote_names_that_need_it() -> None:
         "MyFunc": '"MyFunc"',
         "my func": '"my func"',
     }
+
+
+@pytest.mark.parametrize(
+    "data_type,expected",
+    [
+        ("character varying", "varchar"),
+        ("integer", "int4"),
+        ("bigint", "int8"),
+        ("double precision", "float8"),
+        ("timestamp without time zone", "timestamp"),
+        ("numeric", "numeric"),
+        ("super", "super"),
+    ],
+)
+def test_column_types_are_spelled_as_the_driver_spells_them(
+    data_type: str, expected: str
+) -> None:
+    cursor = _RecordingCursor(rows=[("dev", "s", "t", "c", data_type, 8, 2, 1)])
+    [row] = catalog_queries.columns(cursor, "dev", all_databases=False)  # type: ignore[arg-type]
+    assert row == ("dev", "s", "t", "c", expected, 8, 2, 1)
