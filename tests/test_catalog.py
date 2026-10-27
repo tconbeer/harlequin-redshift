@@ -24,6 +24,7 @@ from harlequin_redshift.catalog import (
     relation_class,
     relation_item,
 )
+from harlequin_redshift.quoting import qualified_name, quote_identifier
 
 # -- item construction (no cluster needed) ------------------------------------
 
@@ -230,7 +231,7 @@ def test_columns_come_back_in_ordinal_order(
     database, schema, relation = a_relation
     from_adapter = connection._get_columns(database, schema, relation)
     cur = connection.execute(
-        f'select * from "{schema}"."{relation}" where false'  # noqa: S608
+        f"select * from {qualified_name(schema, relation)} where false"
     )
     assert cur is not None
     cur.fetchall()
@@ -298,7 +299,7 @@ def test_search_finds_a_column(
     assert matching
     [found] = matching
     assert isinstance(found.item, ColumnCatalogItem)
-    assert found.item.query_name == f'"{column_name}"'
+    assert found.item.query_name == quote_identifier(column_name)
     assert found.item.type_name == column_type
 
 

@@ -1,8 +1,8 @@
 """Catalog queries this adapter runs itself, with every name bound as a parameter.
 
-They stand in for the driver's legacy catalog queries, which strip quotes,
-spaces, and ``-;/`` from the names they are given and inline what is left, so
-an object whose name holds one of those cannot be found through them.
+The driver's own catalog queries strip quotes, spaces, and ``-;/`` from the
+names they are given and inline what is left, so an object whose name holds one
+of those cannot be found through them; these bind each name instead.
 
 Each function returns rows in the shape the adapter reads, whichever view
 answered: a schema is ``(schema, database)``, a relation is ``(database,
