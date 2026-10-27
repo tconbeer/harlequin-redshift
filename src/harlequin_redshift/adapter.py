@@ -634,6 +634,7 @@ class HarlequinRedshiftConnection(HarlequinConnection):
         call: Callable[[Cursor], Any],
         what: str,
         fallback: Callable[[Cursor], Any] | None = None,
+        like_patterns: Sequence[str] = (),
     ) -> MetadataRows:
         """Runs one of the driver's metadata calls.
 
@@ -642,8 +643,16 @@ class HarlequinRedshiftConnection(HarlequinConnection):
         column-index map makes it fail, so that a catalog still loads on a
         cluster where that path is broken. Anything the server itself refused is
         raised as it is.
+
+        `like_patterns` are the exact names `call` passes as LIKE patterns. A
+        ``%`` or ``_`` in one only matches extra names, which callers filter
+        out, but a backslash escapes the character after it, so a name holding
+        one goes to `fallback`, which matches names exactly.
         """
-        if fallback is not None and not self._use_show_metadata:
+        if fallback is not None and (
+            not self._use_show_metadata
+            or any("\\" in pattern for pattern in like_patterns)
+        ):
             return self._catalog_query(fallback, what)
         try:
             with self._metadata_cursor() as cur:
@@ -720,6 +729,7 @@ class HarlequinRedshiftConnection(HarlequinConnection):
             fallback=lambda cur: catalog_queries.relations(
                 cur, database, all_databases=self.all_databases, schema=schema
             ),
+            like_patterns=(schema,),
         )
         # the driver's schema filter is a LIKE pattern, so a schema whose name
         # holds a wildcard character matches more than itself; the exact name is
@@ -748,6 +758,7 @@ class HarlequinRedshiftConnection(HarlequinConnection):
                 schema=schema,
                 relation=relation,
             ),
+            like_patterns=(schema, relation),
         )
         matching = [
             row

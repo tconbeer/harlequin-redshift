@@ -79,14 +79,16 @@ def test_catalog_queries_bind_every_name(name: str, all_databases: bool) -> None
         _assert_bound(sql, params, database, *params)
 
 
-def _connection(cursor: _RecordingCursor) -> HarlequinRedshiftConnection:
+def _connection(
+    cursor: _RecordingCursor, use_show_metadata: bool = False
+) -> HarlequinRedshiftConnection:
     """A connection stub whose catalog queries run against `cursor`."""
     conn = HarlequinRedshiftConnection.__new__(HarlequinRedshiftConnection)
     conn.database = "dev"
     conn.all_databases = False
     conn.read_only = False
     conn._session_read_only = True
-    conn._use_show_metadata = False
+    conn._use_show_metadata = use_show_metadata
 
     @contextmanager
     def _metadata_cursor() -> Iterator[_RecordingCursor]:
@@ -112,6 +114,55 @@ def test_the_tree_loads_awkward_names_exactly(name: str) -> None:
     sql, params = cursor.calls[-1]
     assert params == ["dev", name, name]
     _assert_bound(sql, params, name)
+
+
+class _ShowCursor(_RecordingCursor):
+    """A cursor whose SHOW path answers with one relation and one column."""
+
+    def __init__(self, name: str) -> None:
+        super().__init__(rows=[("dev", name, name, "TABLE")])
+        self.name = name
+        self.show_calls = 0
+
+    def get_tables(self, **kwargs: object) -> list:
+        self.show_calls += 1
+        return [("dev", self.name, self.name, "TABLE")]
+
+    def get_columns(self, **kwargs: object) -> list:
+        self.show_calls += 1
+        jdbc_row = [None] * 17
+        jdbc_row[:4] = ["dev", self.name, self.name, self.name]
+        jdbc_row[5], jdbc_row[6], jdbc_row[16] = "int4", 10, 1
+        return [tuple(jdbc_row)]
+
+
+@pytest.mark.parametrize("name", ["plain", "per%cent_under", 'we"ird name'])
+def test_the_show_path_takes_names_without_a_backslash(name: str) -> None:
+    cursor = _ShowCursor(name)
+    conn = _connection(cursor, use_show_metadata=True)
+
+    assert conn._get_relations("dev", name) == [(name, "TABLE")]
+    assert conn._get_columns("dev", name, name) == [(name, "int4")]
+    assert cursor.show_calls == 2
+    assert cursor.calls == []
+
+
+@pytest.mark.parametrize("name", ["a\\b", "trailing\\"])
+def test_a_backslash_name_skips_the_show_path(name: str) -> None:
+    """SHOW matches names with LIKE, where a backslash escapes the next character."""
+    cursor = _ShowCursor(name)
+    conn = _connection(cursor, use_show_metadata=True)
+
+    assert conn._get_relations("dev", name) == [(name, "TABLE")]
+    cursor.rows = [("dev", name, name, name, "int4", 10, None, 1)]
+    assert conn._get_columns("dev", name, name) == [(name, "int4")]
+    assert cursor.show_calls == 0
+    assert [params for _sql, params in cursor.calls] == [
+        ["dev", name],
+        ["dev", name, name],
+    ]
+    # the SHOW path stays on for every other name
+    assert conn._use_show_metadata is True
 
 
 @pytest.mark.parametrize("name", AWKWARD_NAMES)

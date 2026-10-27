@@ -7,8 +7,8 @@ All notable changes to this project will be documented in this file.
 ### Bug Fixes
 
 - Objects whose names contain quotes, backslashes, spaces, or other special
-  characters now load in the catalog, match in search, and are targeted
-  correctly by catalog actions; "Set Search Path" now works
+  characters now load in the catalog on every cluster, match in search, and are
+  targeted correctly by catalog actions; "Set Search Path" now works
   ([#1209](https://github.com/tconbeer/harlequin/issues/1209)).
 
 ## [0.1.0] - 2026-09-01
