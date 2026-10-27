@@ -11,6 +11,7 @@ import pytest
 from harlequin.adapter import HarlequinAdapter, HarlequinConnection, HarlequinCursor
 from harlequin.catalog import Catalog, CatalogItem
 from harlequin.exception import HarlequinConnectionError, HarlequinQueryError
+from redshift_connector import InterfaceError
 from textual_fastdatatable.backend import create_backend
 
 from harlequin_redshift import HarlequinRedshiftAdapter
@@ -587,3 +588,65 @@ def test_without_a_fallback_the_error_explains_itself() -> None:
     with pytest.raises(HarlequinQueryError) as excinfo:
         conn._metadata(lambda cur: cur.get_schemas(), "the schemas in dev")
     assert "database-metadata-current-db-only" in str(excinfo.value)
+
+
+class _VersionCursor:
+    def __init__(self, version: int | Exception) -> None:
+        self.version = version
+
+    def get_show_discovery_version(self) -> int:
+        if isinstance(self.version, Exception):
+            raise self.version
+        return self.version
+
+    def close(self) -> None:
+        pass
+
+
+class _VersionConnection:
+    def __init__(self, version: int | Exception) -> None:
+        self.version = version
+
+    def cursor(self) -> _VersionCursor:
+        return _VersionCursor(self.version)
+
+
+@pytest.mark.parametrize(
+    "version,expected",
+    [(3, False), (4, True), (5, True), (InterfaceError("connection is closed"), False)],
+)
+def test_the_show_path_needs_show_discovery_version_4(
+    version: int | Exception, expected: bool
+) -> None:
+    """Below version 4 the driver falls back to queries that mangle names."""
+    conn = _connection_with_cursor(_BrokenCursor())
+    conn._main_conn = _VersionConnection(version)  # type: ignore[assignment]
+    assert conn._supports_show_metadata() is expected
+
+
+@pytest.mark.parametrize("version", [3, InterfaceError("connection is closed")])
+def test_without_the_show_path_the_tree_uses_catalog_queries(
+    version: int | Exception,
+) -> None:
+    cursor = _BrokenCursor()
+    conn = _connection_with_cursor(cursor)
+    conn._main_conn = _VersionConnection(version)  # type: ignore[assignment]
+    conn._use_show_metadata = conn._supports_show_metadata()
+
+    assert conn._get_schemas("dev") == ["public"]
+    # the SHOW call would have raised; the catalog query answered instead
+    assert cursor.fallback_calls == 1
+
+
+def test_with_the_show_path_the_tree_asks_the_driver() -> None:
+    class _ShowCursor(_BrokenCursor):
+        def get_schemas(self, **kwargs: object) -> list:
+            return [("analytics", "dev")]
+
+    cursor = _ShowCursor()
+    conn = _connection_with_cursor(cursor)
+    conn._main_conn = _VersionConnection(4)  # type: ignore[assignment]
+    conn._use_show_metadata = conn._supports_show_metadata()
+
+    assert conn._get_schemas("dev") == ["analytics"]
+    assert cursor.fallback_calls == 0
