@@ -103,5 +103,7 @@ AWKWARD_NAMES = [
     '"; drop table users; --',
     "per%cent_under",
     "new\nline",
+    "x\n    y",
+    "x\n                y",
 ]
 """Names a catalog can hold that SQL built by interpolation would get wrong."""

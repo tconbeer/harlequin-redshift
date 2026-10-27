@@ -42,6 +42,15 @@ def _database_predicate(item: "RelationCatalogItem | SchemaCatalogItem") -> str:
     return f"database_name = {quote_literal(database)}" if database else "true"
 
 
+def _sql(template: str, **values: str) -> str:
+    """`template` dedented, then filled in with `values`.
+
+    Filling in after dedenting leaves a value that holds a newline and
+    indentation, such as a quoted name, exactly as it is.
+    """
+    return dedent(template.strip("\n")).format(**values)
+
+
 def _one_line(text: str) -> str:
     """`text` with its line breaks flattened, to sit inside a ``--`` comment.
 
@@ -102,12 +111,13 @@ def show_select_star(
     driver: "HarlequinDriver",
 ) -> None:
     driver.insert_text_in_new_buffer(
-        dedent(
-            f"""
+        _sql(
+            """
             select *
-            from {item.qualified_identifier}
+            from {relation}
             limit 100
-            """.strip("\n")
+            """,
+            relation=item.qualified_identifier,
         )
     )
 
@@ -127,8 +137,8 @@ def show_describe_relation(
         )
         return
     driver.insert_text_in_new_buffer(
-        dedent(
-            f"""
+        _sql(
+            """
             select
                 column_name as "Column",
                 ordinal_position as "#",
@@ -138,11 +148,14 @@ def show_describe_relation(
                 remarks as "Description"
             from svv_all_columns
             where
-                {_database_predicate(item)}
-                and schema_name = {quote_literal(item.parent.label)}
-                and table_name = {quote_literal(item.label)}
+                {database_predicate}
+                and schema_name = {schema}
+                and table_name = {relation}
             order by ordinal_position
-            """.strip("\n")
+            """,
+            database_predicate=_database_predicate(item),
+            schema=quote_literal(item.parent.label),
+            relation=quote_literal(item.label),
         )
     )
 
@@ -164,8 +177,8 @@ def show_describe_table_design(
         )
         return
     driver.insert_text_in_new_buffer(
-        dedent(
-            f"""
+        _sql(
+            """
             select
                 column_name as "Column",
                 ordinal_position as "#",
@@ -177,11 +190,14 @@ def show_describe_table_design(
                 column_default as "Default"
             from svv_redshift_columns
             where
-                {_database_predicate(item)}
-                and schema_name = {quote_literal(item.parent.label)}
-                and table_name = {quote_literal(item.label)}
+                {database_predicate}
+                and schema_name = {schema}
+                and table_name = {relation}
             order by ordinal_position
-            """.strip("\n")
+            """,
+            database_predicate=_database_predicate(item),
+            schema=quote_literal(item.parent.label),
+            relation=quote_literal(item.label),
         )
     )
 
@@ -202,8 +218,8 @@ def show_table_info(
         )
         return
     driver.insert_text_in_new_buffer(
-        dedent(
-            f"""
+        _sql(
+            """
             select
                 "schema" as "Schema",
                 "table" as "Table",
@@ -220,9 +236,11 @@ def show_table_info(
                 encoded as "Encoded"
             from svv_table_info
             where
-                "schema" = {quote_literal(item.parent.label)}
-                and "table" = {quote_literal(item.label)}
-            """.strip("\n")
+                "schema" = {schema}
+                and "table" = {relation}
+            """,
+            schema=quote_literal(item.parent.label),
+            relation=quote_literal(item.label),
         )
     )
 
@@ -244,8 +262,8 @@ def show_describe_table_constraints(
         )
         return
     driver.insert_text_in_new_buffer(
-        dedent(
-            f"""
+        _sql(
+            """
             -- Redshift records these constraints for the query planner but
             -- does not enforce them; data is not validated against them.
             select
@@ -265,10 +283,12 @@ def show_describe_table_constraints(
             join pg_catalog.pg_namespace n on n.oid = c.relnamespace
             left join pg_catalog.pg_class fc on con.confrelid = fc.oid
             where
-                c.relname = {quote_literal(item.label)}
-                and n.nspname = {quote_literal(item.parent.label)}
+                c.relname = {relation}
+                and n.nspname = {schema}
             order by con.conname
-            """.strip("\n")
+            """,
+            relation=quote_literal(item.label),
+            schema=quote_literal(item.parent.label),
         )
     )
 
@@ -285,8 +305,8 @@ def show_external_table_definition(
         )
         return
     driver.insert_text_in_new_buffer(
-        dedent(
-            f"""
+        _sql(
+            """
             select
                 schemaname as "Schema",
                 tablename as "Table",
@@ -298,9 +318,11 @@ def show_external_table_definition(
                 parameters as "Parameters"
             from svv_external_tables
             where
-                schemaname = {quote_literal(item.parent.label)}
-                and tablename = {quote_literal(item.label)}
-            """.strip("\n")
+                schemaname = {schema}
+                and tablename = {relation}
+            """,
+            schema=quote_literal(item.parent.label),
+            relation=quote_literal(item.label),
         )
     )
 
@@ -317,8 +339,8 @@ def show_materialized_view_info(
         )
         return
     driver.insert_text_in_new_buffer(
-        dedent(
-            f"""
+        _sql(
+            """
             select
                 database_name as "Database",
                 schema_name as "Schema",
@@ -330,9 +352,11 @@ def show_materialized_view_info(
                 updated_upto_xid as "Updated Up To XID"
             from svv_mv_info
             where
-                schema_name = {quote_literal(item.parent.label)}
-                and name = {quote_literal(item.label)}
-            """.strip("\n")
+                schema_name = {schema}
+                and name = {relation}
+            """,
+            schema=quote_literal(item.parent.label),
+            relation=quote_literal(item.label),
         )
     )
 
@@ -357,8 +381,8 @@ def show_list_objects(
         f"database_name = {quote_literal(database)}" if database else "true"
     )
     driver.insert_text_in_new_buffer(
-        dedent(
-            f"""
+        _sql(
+            """
             select
                 database_name as "Database",
                 schema_name as "Schema",
@@ -370,7 +394,9 @@ def show_list_objects(
                 {database_filter}
                 {scope}
             order by 1, 2, 3
-            """.strip("\n")
+            """,
+            database_filter=database_filter,
+            scope=scope,
         )
     )
 
@@ -380,8 +406,8 @@ def show_list_schemas(
     driver: "HarlequinDriver",
 ) -> None:
     driver.insert_text_in_new_buffer(
-        dedent(
-            f"""
+        _sql(
+            """
             select
                 database_name as "Database",
                 schema_name as "Schema",
@@ -390,9 +416,10 @@ def show_list_schemas(
                 source_database as "Source Database",
                 schema_acl as "Privileges"
             from svv_all_schemas
-            where database_name = {quote_literal(item.label)}
+            where database_name = {database}
             order by 1, 2
-            """.strip("\n")
+            """,
+            database=quote_literal(item.label),
         )
     )
 
@@ -412,8 +439,8 @@ def show_storage_summary(
     else:
         scope = ""
     driver.insert_text_in_new_buffer(
-        dedent(
-            f"""
+        _sql(
+            """
             select
                 "schema" as "Schema",
                 "table" as "Table",
@@ -428,7 +455,8 @@ def show_storage_summary(
             {scope}
             order by size desc nulls last
             limit 100
-            """.strip("\n")
+            """,
+            scope=scope,
         )
     )
 
