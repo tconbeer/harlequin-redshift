@@ -35,6 +35,7 @@ from harlequin_redshift.interactions import (
     show_table_info,
     show_view_definition,
 )
+from harlequin_redshift.quoting import quote_identifier
 
 if TYPE_CHECKING:
     from harlequin_redshift.adapter import HarlequinRedshiftConnection
@@ -60,9 +61,10 @@ class ColumnCatalogItem(InteractiveCatalogItem["HarlequinRedshiftConnection"]):
         type_label: str,
         type_name: str | None = None,
     ) -> "ColumnCatalogItem":
+        column_identifier = quote_identifier(label)
         return cls(
-            qualified_identifier=f'{parent.qualified_identifier}."{label}"',
-            query_name=f'"{label}"',
+            qualified_identifier=f"{parent.qualified_identifier}.{column_identifier}",
+            query_name=column_identifier,
             label=label,
             type_label=type_label,
             type_name=type_name,
@@ -90,9 +92,10 @@ class RelationCatalogItem(InteractiveCatalogItem["HarlequinRedshiftConnection"])
         label: str,
         type_name: str | None = None,
     ) -> "RelationCatalogItem":
+        relation_identifier = quote_identifier(label)
         return cls(
-            qualified_identifier=f'{parent.qualified_identifier}."{label}"',
-            query_name=f'{parent.query_name}."{label}"',
+            qualified_identifier=f"{parent.qualified_identifier}.{relation_identifier}",
+            query_name=f"{parent.query_name}.{relation_identifier}",
             label=label,
             type_label=cls.TYPE_LABEL,
             type_name=type_name or cls.DEFAULT_TYPE_NAME,
@@ -200,9 +203,8 @@ _RELATION_CLASSES: dict[str, type[RelationCatalogItem]] = {
 }
 """The item class for each relation type the server reports.
 
-``get_tables()`` spells the type differently depending on whether the cluster
-answers metadata from SHOW discovery, from SVV_ALL_TABLES, or from the driver's
-legacy pg_catalog query, so every spelling that reaches us is mapped here.
+The driver's SHOW discovery, SVV_TABLES, and SVV_ALL_TABLES each spell relation
+types their own way, so every spelling that reaches us is mapped here.
 """
 
 
@@ -242,14 +244,15 @@ class SchemaCatalogItem(InteractiveCatalogItem["HarlequinRedshiftConnection"]):
         parent: "DatabaseCatalogItem",
         label: str,
     ) -> "SchemaCatalogItem":
+        schema_identifier = quote_identifier(label)
         return cls(
-            qualified_identifier=f'{parent.qualified_identifier}."{label}"',
+            qualified_identifier=f"{parent.qualified_identifier}.{schema_identifier}",
             # a schema in another database is only addressable three-part, so
             # the query name carries the database only when it has to
             query_name=(
-                f'"{label}"'
+                schema_identifier
                 if parent.is_connected_database
-                else f'{parent.query_name}."{label}"'
+                else f"{parent.query_name}.{schema_identifier}"
             ),
             label=label,
             type_label="sch",
@@ -289,7 +292,7 @@ class DatabaseCatalogItem(InteractiveCatalogItem["HarlequinRedshiftConnection"])
     def from_label(
         cls, label: str, connection: "HarlequinRedshiftConnection"
     ) -> "DatabaseCatalogItem":
-        database_identifier = f'"{label}"'
+        database_identifier = quote_identifier(label)
         return cls(
             qualified_identifier=database_identifier,
             query_name=database_identifier,

@@ -3,16 +3,16 @@
 Redshift speaks the Postgres wire protocol but is not Postgres: psycopg cannot
 talk to it, its catalog spans databases through datashares, and its DDL, tuning
 views, and cancellation are its own. This adapter uses Amazon's own driver, and
-reads the catalog through that driver's metadata calls rather than through
-hand-written system-table queries, so a cluster answers with whichever path it
-supports -- server-side SHOW discovery on current clusters, the cross-database
-SVV_ALL_* views, or the driver's legacy pg_catalog queries on older ones.
+reads the catalog tree through that driver's server-side SHOW metadata calls on
+clusters that support them, and through its own bound catalog queries
+(`catalog_queries`) on clusters that do not.
 """
 
 from __future__ import annotations
 
 import logging
 from contextlib import contextmanager
+from functools import partial
 from itertools import cycle
 from typing import Any, Callable, Iterator, Sequence, cast
 
@@ -34,6 +34,7 @@ from harlequin.exception import HarlequinConnectionError, HarlequinQueryError
 from redshift_connector import Connection, Cursor
 from textual_fastdatatable.backend import AutoBackendType
 
+from harlequin_redshift import catalog_queries
 from harlequin_redshift.catalog import (
     ColumnCatalogItem,
     DatabaseCatalogItem,
@@ -45,6 +46,7 @@ from harlequin_redshift.cli_options import REDSHIFT_OPTIONS
 from harlequin_redshift.completions import _get_completions
 from harlequin_redshift.conn_str import ConnStrError, build_connect_kwargs
 from harlequin_redshift.pool import RedshiftConnectionPool
+from harlequin_redshift.quoting import like_contains
 
 logger = logging.getLogger(__name__)
 
@@ -84,10 +86,18 @@ map is built from a different result set than the one being read, the lookup
 raises -- `KeyError: 'database_name'` from `get_catalog_list()` is the case seen
 in the wild, on a cluster with multi-database catalog metadata enabled.
 
-Every affected call has a legacy sibling that queries the catalog tables
-directly and never builds that map, so these are worth retrying there rather
-than handing the user a broken catalog. A server-side error is not in this
-tuple: a permission or connection failure must still surface.
+Every affected call has a fallback catalog query that never builds that map, so
+these are worth retrying there rather than handing the user a broken catalog.
+A server-side error is not in this tuple: a permission or connection failure
+must still surface.
+"""
+
+_MIN_SHOW_DISCOVERY_VERSION = 4
+"""The server-side metadata version the driver's SHOW path needs.
+
+Below it, the driver answers its metadata calls with its legacy catalog
+queries, which mangle names (see `catalog_queries`), so this adapter runs its
+own instead.
 """
 
 _SIZED_TYPES = frozenset(
@@ -106,10 +116,14 @@ _SIZED_TYPES = frozenset(
 
 _PRECISION_TYPES = frozenset({"decimal", "numeric"})
 
-# JDBC-shaped result offsets for the driver's metadata calls
+# offsets into the rows `catalog_queries` returns, which the driver's
+# JDBC-shaped relation rows share
 _TABLE_SCHEM, _TABLE_NAME, _TABLE_TYPE = 1, 2, 3
-_COLUMN_NAME, _COLUMN_TYPE_NAME = 3, 5
-_COLUMN_SIZE, _DECIMAL_DIGITS, _ORDINAL_POSITION = 6, 8, 16
+_COLUMN_NAME, _COLUMN_TYPE_NAME = 3, 4
+_COLUMN_SIZE, _DECIMAL_DIGITS, _ORDINAL_POSITION = 5, 6, 7
+
+# offsets into the driver's JDBC-shaped column rows
+_JDBC_COLUMN_OFFSETS = (0, 1, 2, 3, 5, 6, 8, 16)
 
 
 def _error_detail(e: BaseException) -> dict[str, str]:
@@ -185,38 +199,9 @@ def _text(value: Any) -> str:
     return "" if value is None else str(value)
 
 
-MetadataCalls = tuple[Callable[[Cursor], Any], Callable[[Cursor], Any]]
-"""One metadata call and the legacy query that stands in for it."""
-
-
-def _schemas_matching(database: str, pattern: str) -> MetadataCalls:
-    """The driver calls that find schemas whose name matches `pattern`."""
-    return (
-        lambda cur: cur.get_schemas(catalog=database, schema_pattern=pattern),
-        lambda cur: cur.get_schemas_legacy_hardcoded_query(
-            catalog=database, schema_pattern=pattern
-        ),
-    )
-
-
-def _relations_matching(database: str, pattern: str) -> MetadataCalls:
-    """The driver calls that find relations whose name matches `pattern`."""
-    return (
-        lambda cur: cur.get_tables(catalog=database, table_name_pattern=pattern),
-        lambda cur: cur.get_tables_legacy_hardcoded_query(
-            catalog=database, table_name_pattern=pattern
-        ),
-    )
-
-
-def _columns_matching(database: str, pattern: str) -> MetadataCalls:
-    """The driver calls that find columns whose name matches `pattern`."""
-    return (
-        lambda cur: cur.get_columns(catalog=database, columnname_pattern=pattern),
-        lambda cur: cur.get_columns_legacy_hardcoded_query(
-            catalog=database, columnname_pattern=pattern
-        ),
-    )
+def _jdbc_columns(rows: MetadataRows) -> MetadataRows:
+    """The driver's column rows, in the shape `catalog_queries.columns()` returns."""
+    return [tuple(row[offset] for offset in _JDBC_COLUMN_OFFSETS) for row in rows]
 
 
 def _is_user_schema(schema: str | None) -> bool:
@@ -306,13 +291,15 @@ class HarlequinRedshiftConnection(HarlequinConnection):
         ] = not self.all_databases
 
         self.database: str = str(self.connect_kwargs["database"])
+        """The connected database's name, as the server spells it once connected."""
         self._use_show_metadata = True
-        """False once the driver's server-side metadata path has been seen to fail.
+        """False when the driver's server-side metadata path is not used.
 
         That path is faster for a single node of the tree, but on a cluster
         where its cached column-index map is wrong it raises every time. The
         first failure switches this off so the rest of the session goes straight
         to the catalog queries instead of paying for a doomed attempt per node.
+        It also starts off on a cluster too old for that path.
         """
         self._query_running = False
         """True while a statement is on the wire on the main connection."""
@@ -339,7 +326,9 @@ class HarlequinRedshiftConnection(HarlequinConnection):
                 title="Harlequin could not connect to Redshift.",
             ) from e
 
-        self._backend_pid: int | None = self._get_backend_pid()
+        self._backend_pid: int | None = None
+        self._read_session()
+        self._use_show_metadata = self._supports_show_metadata()
 
         self._transaction_modes = cycle(
             [
@@ -449,22 +438,40 @@ class HarlequinRedshiftConnection(HarlequinConnection):
             except Exception:
                 logger.debug("Could not end the read-only probe", exc_info=True)
 
-    def _get_backend_pid(self) -> int | None:
-        """The server-side process id of the main connection.
+    def _read_session(self) -> None:
+        """Reads the main connection's process id and database name.
 
-        Redshift cancels a running statement by process id, so this is looked up
-        once, while the connection is idle, and kept for ``cancel()``.
+        Redshift cancels a running statement by process id, so it is looked up
+        once, while the connection is idle, and kept for ``cancel()``. The
+        database name the user typed may differ in case from the one the
+        server reports, and the catalog names databases the server's way.
         """
         cur = self._main_conn.cursor()
         try:
-            cur.execute("select pg_backend_pid()")
+            cur.execute("select pg_backend_pid(), current_database()")
             result = cur.fetchone()
         except Exception:
-            logger.debug("Could not read the backend pid", exc_info=True)
-            return None
+            logger.debug("Could not read the session's pid and database", exc_info=True)
+            return
         finally:
             _close_quietly(cur)
-        return int(result[0]) if result else None
+        if not result:
+            return
+        self._backend_pid = int(result[0])
+        if result[1]:
+            self.database = str(result[1])
+
+    def _supports_show_metadata(self) -> bool:
+        """True if the driver's metadata calls take the server-side SHOW path."""
+        cur = self._main_conn.cursor()
+        try:
+            version = cur.get_show_discovery_version()
+        except Exception:
+            logger.debug("Could not read the show discovery version", exc_info=True)
+            return False
+        finally:
+            _close_quietly(cur)
+        return version >= _MIN_SHOW_DISCOVERY_VERSION
 
     # -- transactions ---------------------------------------------------------
 
@@ -634,24 +641,34 @@ class HarlequinRedshiftConnection(HarlequinConnection):
         self,
         call: Callable[[Cursor], Any],
         what: str,
-        legacy: Callable[[Cursor], Any] | None = None,
+        fallback: Callable[[Cursor], Any] | None = None,
+        like_patterns: Sequence[str] = (),
     ) -> MetadataRows:
         """Runs one of the driver's metadata calls.
 
-        `legacy` is the same call spelled as a direct catalog query. It is used
-        only when the fast path fails the way the driver's cached column-index
-        map makes it fail, so that a catalog still loads on a cluster where that
-        path is broken. Anything the server itself refused is raised as it is.
+        `fallback` is the same call spelled as one of `catalog_queries`. It is
+        used when the fast path is off, or fails the way the driver's cached
+        column-index map makes it fail, so that a catalog still loads on a
+        cluster where that path is broken. Anything the server itself refused is
+        raised as it is.
+
+        `like_patterns` are the exact names `call` passes as LIKE patterns. A
+        ``%`` or ``_`` in one only matches extra names, which callers filter
+        out, but a backslash escapes the character after it, so a name holding
+        one goes to `fallback`, which matches names exactly.
         """
-        if legacy is not None and not self._use_show_metadata:
-            return self._catalog_query(legacy, what)
+        if fallback is not None and (
+            not self._use_show_metadata
+            or any("\\" in pattern for pattern in like_patterns)
+        ):
+            return self._catalog_query(fallback, what)
         try:
             with self._metadata_cursor() as cur:
                 return cast(MetadataRows, call(cur))
         except HarlequinQueryError:
             raise
         except _DRIVER_INDEXING_ERRORS:
-            if legacy is None:
+            if fallback is None:
                 raise HarlequinQueryError(
                     msg=(
                         "The Redshift driver could not read its own metadata "
@@ -674,7 +691,7 @@ class HarlequinRedshiftConnection(HarlequinConnection):
                 title=f"Redshift raised an error reading {what}:",
             ) from e
 
-        return self._catalog_query(legacy, what)
+        return self._catalog_query(fallback, what)
 
     def _catalog_query(self, call: Callable[[Cursor], Any], what: str) -> MetadataRows:
         """Reads the catalog with one query, not the driver's server-side path.
@@ -699,7 +716,7 @@ class HarlequinRedshiftConnection(HarlequinConnection):
         rows = self._metadata(
             lambda cur: cur.get_catalogs(),
             "the list of databases",
-            legacy=lambda cur: cur.get_catalogs_legacy_hardcoded_query(),
+            fallback=lambda cur: cur.get_catalogs_legacy_hardcoded_query(),
         )
         return sorted({_text(row[0]) for row in rows if row[0]})
 
@@ -707,7 +724,9 @@ class HarlequinRedshiftConnection(HarlequinConnection):
         rows = self._metadata(
             lambda cur: cur.get_schemas(catalog=database),
             f"the schemas in {database}",
-            legacy=lambda cur: cur.get_schemas_legacy_hardcoded_query(catalog=database),
+            fallback=lambda cur: catalog_queries.schemas(
+                cur, database, all_databases=self.all_databases
+            ),
         )
         return sorted({_text(row[0]) for row in rows if _is_user_schema(_text(row[0]))})
 
@@ -715,9 +734,10 @@ class HarlequinRedshiftConnection(HarlequinConnection):
         rows = self._metadata(
             lambda cur: cur.get_tables(catalog=database, schema_pattern=schema),
             f"the relations in {database}.{schema}",
-            legacy=lambda cur: cur.get_tables_legacy_hardcoded_query(
-                catalog=database, schema_pattern=schema
+            fallback=lambda cur: catalog_queries.relations(
+                cur, database, all_databases=self.all_databases, schema=schema
             ),
+            like_patterns=(schema,),
         )
         # the driver's schema filter is a LIKE pattern, so a schema whose name
         # holds a wildcard character matches more than itself; the exact name is
@@ -733,13 +753,20 @@ class HarlequinRedshiftConnection(HarlequinConnection):
         self, database: str, schema: str, relation: str
     ) -> list[tuple[str, str]]:
         rows = self._metadata(
-            lambda cur: cur.get_columns(
-                catalog=database, schema_pattern=schema, tablename_pattern=relation
+            lambda cur: _jdbc_columns(
+                cur.get_columns(
+                    catalog=database, schema_pattern=schema, tablename_pattern=relation
+                )
             ),
             f"the columns of {database}.{schema}.{relation}",
-            legacy=lambda cur: cur.get_columns_legacy_hardcoded_query(
-                catalog=database, schema_pattern=schema, tablename_pattern=relation
+            fallback=lambda cur: catalog_queries.columns(
+                cur,
+                database,
+                all_databases=self.all_databases,
+                schema=schema,
+                relation=relation,
             ),
+            like_patterns=(schema, relation),
         )
         matching = [
             row
@@ -769,15 +796,15 @@ class HarlequinRedshiftConnection(HarlequinConnection):
     # -- catalog search -------------------------------------------------------
 
     def _search_patterns(self, term: str) -> list[str]:
-        """The LIKE patterns that find `term` anywhere in a name.
+        """The LIKE patterns that find `term`, taken literally, anywhere in a name.
 
         Redshift folds unquoted identifiers to lower case unless the cluster
-        turns on case-sensitive identifiers, and its metadata calls match with
-        LIKE, which is case-sensitive. Searching for the lower-cased term as
-        well as the term as typed covers both.
+        turns on case-sensitive identifiers, and LIKE is case-sensitive.
+        Searching for the lower-cased term as well as the term as typed covers
+        both.
         """
-        patterns = [f"%{term}%"]
-        lowered = f"%{term.lower()}%"
+        patterns = [like_contains(term)]
+        lowered = like_contains(term.lower())
         if lowered != patterns[0]:
             patterns.append(lowered)
         return patterns
@@ -787,8 +814,15 @@ class HarlequinRedshiftConnection(HarlequinConnection):
     ) -> dict[tuple[str, str], tuple[SchemaCatalogItem, tuple[str, ...]]]:
         found: dict[tuple[str, str], tuple[SchemaCatalogItem, tuple[str, ...]]] = {}
         for pattern in self._search_patterns(term):
-            _show, query = _schemas_matching(self.database, pattern)
-            rows = self._catalog_query(query, "the catalog")
+            rows = self._catalog_query(
+                partial(
+                    catalog_queries.schemas,
+                    database=self.database,
+                    all_databases=False,
+                    name_like=pattern,
+                ),
+                "the catalog",
+            )
             for row in rows:
                 schema = _text(row[0])
                 database = _text(row[1]) or self.database
@@ -869,8 +903,15 @@ class HarlequinRedshiftConnection(HarlequinConnection):
 
         if kind in ("all", "relations"):
             for pattern in self._search_patterns(term):
-                _show, query = _relations_matching(self.database, pattern)
-                rows = self._catalog_query(query, "the catalog")
+                rows = self._catalog_query(
+                    partial(
+                        catalog_queries.relations,
+                        database=self.database,
+                        all_databases=False,
+                        name_like=pattern,
+                    ),
+                    "the catalog",
+                )
                 for row in rows:
                     database = _text(row[0]) or self.database
                     schema = _text(row[_TABLE_SCHEM])
@@ -894,8 +935,15 @@ class HarlequinRedshiftConnection(HarlequinConnection):
         if kind in ("all", "columns"):
             relations: dict[tuple[str, str, str], RelationCatalogItem] = {}
             for pattern in self._search_patterns(term):
-                _show, query = _columns_matching(self.database, pattern)
-                rows = self._catalog_query(query, "the catalog")
+                rows = self._catalog_query(
+                    partial(
+                        catalog_queries.columns,
+                        database=self.database,
+                        all_databases=False,
+                        name_like=pattern,
+                    ),
+                    "the catalog",
+                )
                 for row in rows:
                     database = _text(row[0]) or self.database
                     schema = _text(row[_TABLE_SCHEM])

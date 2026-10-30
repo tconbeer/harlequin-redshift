@@ -11,6 +11,7 @@ import pytest
 from harlequin.adapter import HarlequinAdapter, HarlequinConnection, HarlequinCursor
 from harlequin.catalog import Catalog, CatalogItem
 from harlequin.exception import HarlequinConnectionError, HarlequinQueryError
+from redshift_connector import InterfaceError
 from textual_fastdatatable.backend import create_backend
 
 from harlequin_redshift import HarlequinRedshiftAdapter
@@ -20,6 +21,7 @@ from harlequin_redshift.adapter import (
     _is_canceled,
     _is_user_schema,
 )
+from harlequin_redshift.catalog import DatabaseCatalogItem
 from harlequin_redshift.cli_options import REDSHIFT_OPTIONS
 
 
@@ -502,13 +504,15 @@ class _BrokenCursor:
 
     def __init__(self, error: Exception | None = None) -> None:
         self.error = error or KeyError("database_name")
-        self.legacy_calls = 0
+        self.fallback_calls = 0
 
     def get_schemas(self, **kwargs: object) -> list:
         raise self.error
 
-    def get_schemas_legacy_hardcoded_query(self, **kwargs: object) -> list:
-        self.legacy_calls += 1
+    def execute(self, sql: str, params: object = None) -> None:
+        self.fallback_calls += 1
+
+    def fetchall(self) -> list:
         return [("public", "dev")]
 
 
@@ -516,6 +520,7 @@ def _connection_with_cursor(cursor: object) -> HarlequinRedshiftConnection:
     """A connection stub whose metadata calls run against `cursor`."""
     conn = HarlequinRedshiftConnection.__new__(HarlequinRedshiftConnection)
     conn.database = "dev"
+    conn.all_databases = False
     conn.read_only = False
     conn._session_read_only = True
     conn._use_show_metadata = True
@@ -531,12 +536,12 @@ def _connection_with_cursor(cursor: object) -> HarlequinRedshiftConnection:
     return conn
 
 
-def test_metadata_falls_back_to_the_legacy_query() -> None:
+def test_metadata_falls_back_to_the_catalog_query() -> None:
     cursor = _BrokenCursor()
     conn = _connection_with_cursor(cursor)
 
     assert conn._get_schemas("dev") == ["public"]
-    assert cursor.legacy_calls == 1
+    assert cursor.fallback_calls == 1
 
 
 def test_a_broken_show_path_is_only_tried_once() -> None:
@@ -550,7 +555,7 @@ def test_a_broken_show_path_is_only_tried_once() -> None:
 
     for _ in range(5):
         assert conn._get_schemas("dev") == ["public"]
-    assert cursor.legacy_calls == 6
+    assert cursor.fallback_calls == 6
 
 
 @pytest.mark.parametrize(
@@ -561,10 +566,10 @@ def test_every_index_error_falls_back(error: Exception) -> None:
     conn = _connection_with_cursor(cursor)
 
     assert conn._get_schemas("dev") == ["public"]
-    assert cursor.legacy_calls == 1
+    assert cursor.fallback_calls == 1
 
 
-def test_a_server_error_is_not_retried_on_the_legacy_query() -> None:
+def test_a_server_error_is_not_retried_on_the_catalog_query() -> None:
     """A permission or connection failure must surface, not be worked around."""
     cursor = _BrokenCursor(
         error=Exception({"C": "42501", "M": "permission denied for database dev"})
@@ -574,13 +579,125 @@ def test_a_server_error_is_not_retried_on_the_legacy_query() -> None:
     with pytest.raises(HarlequinQueryError) as excinfo:
         conn._get_schemas("dev")
     assert "permission denied" in str(excinfo.value)
-    assert cursor.legacy_calls == 0
+    assert cursor.fallback_calls == 0
 
 
-def test_without_a_legacy_query_the_error_explains_itself() -> None:
+def test_without_a_fallback_the_error_explains_itself() -> None:
     cursor = _BrokenCursor()
     conn = _connection_with_cursor(cursor)
 
     with pytest.raises(HarlequinQueryError) as excinfo:
         conn._metadata(lambda cur: cur.get_schemas(), "the schemas in dev")
     assert "database-metadata-current-db-only" in str(excinfo.value)
+
+
+class _VersionCursor:
+    def __init__(self, version: int | Exception) -> None:
+        self.version = version
+
+    def get_show_discovery_version(self) -> int:
+        if isinstance(self.version, Exception):
+            raise self.version
+        return self.version
+
+    def close(self) -> None:
+        pass
+
+
+class _VersionConnection:
+    def __init__(self, version: int | Exception) -> None:
+        self.version = version
+
+    def cursor(self) -> _VersionCursor:
+        return _VersionCursor(self.version)
+
+
+@pytest.mark.parametrize(
+    "version,expected",
+    [(3, False), (4, True), (5, True), (InterfaceError("connection is closed"), False)],
+)
+def test_the_show_path_needs_show_discovery_version_4(
+    version: int | Exception, expected: bool
+) -> None:
+    """Below version 4 the driver falls back to queries that mangle names."""
+    conn = _connection_with_cursor(_BrokenCursor())
+    conn._main_conn = _VersionConnection(version)  # type: ignore[assignment]
+    assert conn._supports_show_metadata() is expected
+
+
+@pytest.mark.parametrize("version", [3, InterfaceError("connection is closed")])
+def test_without_the_show_path_the_tree_uses_catalog_queries(
+    version: int | Exception,
+) -> None:
+    cursor = _BrokenCursor()
+    conn = _connection_with_cursor(cursor)
+    conn._main_conn = _VersionConnection(version)  # type: ignore[assignment]
+    conn._use_show_metadata = conn._supports_show_metadata()
+
+    assert conn._get_schemas("dev") == ["public"]
+    # the SHOW call would have raised; the catalog query answered instead
+    assert cursor.fallback_calls == 1
+
+
+def test_with_the_show_path_the_tree_asks_the_driver() -> None:
+    class _ShowCursor(_BrokenCursor):
+        def get_schemas(self, **kwargs: object) -> list:
+            return [("analytics", "dev")]
+
+    cursor = _ShowCursor()
+    conn = _connection_with_cursor(cursor)
+    conn._main_conn = _VersionConnection(4)  # type: ignore[assignment]
+    conn._use_show_metadata = conn._supports_show_metadata()
+
+    assert conn._get_schemas("dev") == ["analytics"]
+    assert cursor.fallback_calls == 0
+
+
+class _SessionCursor:
+    def __init__(self, row: tuple | Exception) -> None:
+        self.row = row
+
+    def execute(self, sql: str) -> None:
+        if isinstance(self.row, Exception):
+            raise self.row
+
+    def fetchone(self) -> tuple:
+        assert not isinstance(self.row, Exception)
+        return self.row
+
+    def close(self) -> None:
+        pass
+
+
+class _SessionConnection:
+    def __init__(self, row: tuple | Exception) -> None:
+        self.row = row
+
+    def cursor(self) -> _SessionCursor:
+        return _SessionCursor(self.row)
+
+
+def test_the_connected_database_is_named_the_way_the_server_names_it() -> None:
+    """`-d DEV` connects to `dev`, which is the name the catalog reports."""
+    conn = _connection_with_cursor(_BrokenCursor())
+    conn.database = "DEV"
+    conn._main_conn = _SessionConnection((4321, "dev"))  # type: ignore[assignment]
+
+    conn._read_session()
+
+    assert conn.database == "dev"
+    assert conn._backend_pid == 4321
+    database = DatabaseCatalogItem.from_label(label="dev", connection=conn)
+    assert database.is_connected_database is True
+
+
+def test_an_unreadable_session_keeps_the_typed_database() -> None:
+    conn = _connection_with_cursor(_BrokenCursor())
+    conn.database = "DEV"
+    conn._backend_pid = None
+    conn._main_conn = _SessionConnection(InterfaceError("closed"))  # type: ignore[assignment]
+
+    conn._read_session()
+
+    assert conn.database == "DEV"
+    assert conn._backend_pid is None

@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING, Literal, Sequence
 from harlequin.catalog import CatalogItem
 from harlequin.exception import HarlequinQueryError
 
+from harlequin_redshift.quoting import quote_identifier, quote_literal
+
 if TYPE_CHECKING:
     from harlequin.driver import HarlequinDriver
 
@@ -29,17 +31,6 @@ if TYPE_CHECKING:
     )
 
 
-def _literal(value: str) -> str:
-    """A string as a SQL literal, with its quotes escaped.
-
-    These queries are built by interpolation rather than by binding, because
-    they are handed to the user as text to read and run, not executed with
-    parameters.
-    """
-    escaped = value.replace("'", "''")
-    return f"'{escaped}'"
-
-
 def _database_predicate(item: "RelationCatalogItem | SchemaCatalogItem") -> str:
     """The SVV_ALL_* filter that scopes a query to one item's database.
 
@@ -48,7 +39,25 @@ def _database_predicate(item: "RelationCatalogItem | SchemaCatalogItem") -> str:
     the catalog item actually came from.
     """
     database = _root_label(item)
-    return f"database_name = {_literal(database)}" if database else "true"
+    return f"database_name = {quote_literal(database)}" if database else "true"
+
+
+def _sql(template: str, **values: str) -> str:
+    """`template` dedented, then filled in with `values`.
+
+    Filling in after dedenting leaves a value that holds a newline and
+    indentation, such as a quoted name, exactly as it is.
+    """
+    return dedent(template.strip("\n")).format(**values)
+
+
+def _one_line(text: str) -> str:
+    """`text` with its line breaks flattened, to sit inside a ``--`` comment.
+
+    A quoted name may hold a newline, which would end the comment and leave
+    the rest of the name in the buffer as SQL.
+    """
+    return " ".join(text.splitlines())
 
 
 def _root_label(item: CatalogItem) -> str | None:
@@ -70,8 +79,15 @@ def execute_use_statement(
 ) -> None:
     if item.connection is None:
         return
+    if item.parent is not None and not item.parent.is_connected_database:
+        # search_path names schemas of the connected database only
+        driver.notify(
+            f"Cannot switch context to {item.label}: it is in another database.",
+            severity="error",
+        )
+        return
     try:
-        item.connection.execute(f"set search_path to {item.qualified_identifier}")
+        item.connection.execute(f"set search_path to {quote_identifier(item.label)}")
     except HarlequinQueryError:
         driver.notify("Could not switch context", severity="error")
         raise
@@ -95,12 +111,13 @@ def show_select_star(
     driver: "HarlequinDriver",
 ) -> None:
     driver.insert_text_in_new_buffer(
-        dedent(
-            f"""
+        _sql(
+            """
             select *
-            from {item.qualified_identifier}
+            from {relation}
             limit 100
-            """.strip("\n")
+            """,
+            relation=item.qualified_identifier,
         )
     )
 
@@ -120,8 +137,8 @@ def show_describe_relation(
         )
         return
     driver.insert_text_in_new_buffer(
-        dedent(
-            f"""
+        _sql(
+            """
             select
                 column_name as "Column",
                 ordinal_position as "#",
@@ -131,11 +148,14 @@ def show_describe_relation(
                 remarks as "Description"
             from svv_all_columns
             where
-                {_database_predicate(item)}
-                and schema_name = {_literal(item.parent.label)}
-                and table_name = {_literal(item.label)}
+                {database_predicate}
+                and schema_name = {schema}
+                and table_name = {relation}
             order by ordinal_position
-            """.strip("\n")
+            """,
+            database_predicate=_database_predicate(item),
+            schema=quote_literal(item.parent.label),
+            relation=quote_literal(item.label),
         )
     )
 
@@ -157,8 +177,8 @@ def show_describe_table_design(
         )
         return
     driver.insert_text_in_new_buffer(
-        dedent(
-            f"""
+        _sql(
+            """
             select
                 column_name as "Column",
                 ordinal_position as "#",
@@ -170,11 +190,14 @@ def show_describe_table_design(
                 column_default as "Default"
             from svv_redshift_columns
             where
-                {_database_predicate(item)}
-                and schema_name = {_literal(item.parent.label)}
-                and table_name = {_literal(item.label)}
+                {database_predicate}
+                and schema_name = {schema}
+                and table_name = {relation}
             order by ordinal_position
-            """.strip("\n")
+            """,
+            database_predicate=_database_predicate(item),
+            schema=quote_literal(item.parent.label),
+            relation=quote_literal(item.label),
         )
     )
 
@@ -195,8 +218,8 @@ def show_table_info(
         )
         return
     driver.insert_text_in_new_buffer(
-        dedent(
-            f"""
+        _sql(
+            """
             select
                 "schema" as "Schema",
                 "table" as "Table",
@@ -213,9 +236,11 @@ def show_table_info(
                 encoded as "Encoded"
             from svv_table_info
             where
-                "schema" = {_literal(item.parent.label)}
-                and "table" = {_literal(item.label)}
-            """.strip("\n")
+                "schema" = {schema}
+                and "table" = {relation}
+            """,
+            schema=quote_literal(item.parent.label),
+            relation=quote_literal(item.label),
         )
     )
 
@@ -237,8 +262,8 @@ def show_describe_table_constraints(
         )
         return
     driver.insert_text_in_new_buffer(
-        dedent(
-            f"""
+        _sql(
+            """
             -- Redshift records these constraints for the query planner but
             -- does not enforce them; data is not validated against them.
             select
@@ -258,10 +283,12 @@ def show_describe_table_constraints(
             join pg_catalog.pg_namespace n on n.oid = c.relnamespace
             left join pg_catalog.pg_class fc on con.confrelid = fc.oid
             where
-                c.relname = {_literal(item.label)}
-                and n.nspname = {_literal(item.parent.label)}
+                c.relname = {relation}
+                and n.nspname = {schema}
             order by con.conname
-            """.strip("\n")
+            """,
+            relation=quote_literal(item.label),
+            schema=quote_literal(item.parent.label),
         )
     )
 
@@ -278,8 +305,8 @@ def show_external_table_definition(
         )
         return
     driver.insert_text_in_new_buffer(
-        dedent(
-            f"""
+        _sql(
+            """
             select
                 schemaname as "Schema",
                 tablename as "Table",
@@ -291,9 +318,11 @@ def show_external_table_definition(
                 parameters as "Parameters"
             from svv_external_tables
             where
-                schemaname = {_literal(item.parent.label)}
-                and tablename = {_literal(item.label)}
-            """.strip("\n")
+                schemaname = {schema}
+                and tablename = {relation}
+            """,
+            schema=quote_literal(item.parent.label),
+            relation=quote_literal(item.label),
         )
     )
 
@@ -310,8 +339,8 @@ def show_materialized_view_info(
         )
         return
     driver.insert_text_in_new_buffer(
-        dedent(
-            f"""
+        _sql(
+            """
             select
                 database_name as "Database",
                 schema_name as "Schema",
@@ -323,9 +352,11 @@ def show_materialized_view_info(
                 updated_upto_xid as "Updated Up To XID"
             from svv_mv_info
             where
-                schema_name = {_literal(item.parent.label)}
-                and name = {_literal(item.label)}
-            """.strip("\n")
+                schema_name = {schema}
+                and name = {relation}
+            """,
+            schema=quote_literal(item.parent.label),
+            relation=quote_literal(item.label),
         )
     )
 
@@ -342,14 +373,16 @@ def show_list_objects(
     if type(item).__name__ == "SchemaCatalogItem":
         parent = getattr(item, "parent", None)
         database = parent.label if parent is not None else None
-        scope = f"and schema_name = {_literal(item.label)}"
+        scope = f"and schema_name = {quote_literal(item.label)}"
     else:
         database = item.label
         scope = ""
-    database_filter = f"database_name = {_literal(database)}" if database else "true"
+    database_filter = (
+        f"database_name = {quote_literal(database)}" if database else "true"
+    )
     driver.insert_text_in_new_buffer(
-        dedent(
-            f"""
+        _sql(
+            """
             select
                 database_name as "Database",
                 schema_name as "Schema",
@@ -361,7 +394,9 @@ def show_list_objects(
                 {database_filter}
                 {scope}
             order by 1, 2, 3
-            """.strip("\n")
+            """,
+            database_filter=database_filter,
+            scope=scope,
         )
     )
 
@@ -371,8 +406,8 @@ def show_list_schemas(
     driver: "HarlequinDriver",
 ) -> None:
     driver.insert_text_in_new_buffer(
-        dedent(
-            f"""
+        _sql(
+            """
             select
                 database_name as "Database",
                 schema_name as "Schema",
@@ -381,9 +416,10 @@ def show_list_schemas(
                 source_database as "Source Database",
                 schema_acl as "Privileges"
             from svv_all_schemas
-            where database_name = {_literal(item.label)}
+            where database_name = {database}
             order by 1, 2
-            """.strip("\n")
+            """,
+            database=quote_literal(item.label),
         )
     )
 
@@ -399,12 +435,12 @@ def show_storage_summary(
     """
     # can't use isinstance due to circular reference
     if type(item).__name__ == "SchemaCatalogItem":
-        scope = f'where "schema" = {_literal(item.label)}'
+        scope = f'where "schema" = {quote_literal(item.label)}'
     else:
         scope = ""
     driver.insert_text_in_new_buffer(
-        dedent(
-            f"""
+        _sql(
+            """
             select
                 "schema" as "Schema",
                 "table" as "Table",
@@ -419,7 +455,8 @@ def show_storage_summary(
             {scope}
             order by size desc nulls last
             limit 100
-            """.strip("\n")
+            """,
+            scope=scope,
         )
     )
 
@@ -441,7 +478,7 @@ def _show_definition(
     """
     if item.connection is None or item.parent is None:
         return
-    query = f"{show_command} {item.qualified_identifier}"
+    query = f"{show_command} {item.query_name}"
     try:
         cur = item.connection.execute(query)
     except HarlequinQueryError:
@@ -458,8 +495,8 @@ def _show_definition(
         return
     definition = str(result[0][0])
     driver.insert_text_in_new_buffer(
-        f"-- {what.capitalize()} definition for {item.query_name}\n"
-        f"-- from: {query}\n\n"
+        f"-- {what.capitalize()} definition for {_one_line(item.query_name)}\n"
+        f"-- from: {_one_line(query)}\n\n"
         f"{definition}"
     )
 
@@ -492,7 +529,7 @@ def execute_drop_relation_statement(
         if item.connection is None:
             return
         try:
-            item.connection.execute(f"drop {relation_type} {item.qualified_identifier}")
+            item.connection.execute(f"drop {relation_type} {item.query_name}")
         except HarlequinQueryError:
             driver.notify(
                 f"Could not drop {relation_type} {item.label}", severity="error"
@@ -541,7 +578,7 @@ def execute_drop_schema_statement(
         if item.connection is None:
             return
         try:
-            item.connection.execute(f"drop schema {item.qualified_identifier} cascade")
+            item.connection.execute(f"drop schema {item.query_name} cascade")
         except HarlequinQueryError:
             driver.notify(f"Could not drop schema {item.label}", severity="error")
             raise

@@ -1,9 +1,11 @@
 """Fixtures for the harlequin-redshift tests.
 
-The integration tests here run against a real Amazon Redshift cluster and never
-write to it: they create nothing, drop nothing, and read only what the cluster
-already has. Everything they assert on is discovered from the catalog at run
-time, so the suite works against any cluster without being told what is in it.
+The integration tests here run against a real Amazon Redshift cluster and,
+with one exception, never write to it: they create nothing, drop nothing, and
+read only what the cluster already has. Everything they assert on is discovered
+from the catalog at run time, so the suite works against any cluster without
+being told what is in it. The exception creates one uniquely named schema to
+hold objects whose names need quoting, and drops it when it is done.
 
 Point them at a cluster with a Harlequin profile. By default they look for a
 profile named ``redshift-test`` in the config files Harlequin itself discovers::
